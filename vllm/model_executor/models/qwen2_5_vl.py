@@ -47,7 +47,13 @@ from vllm.compilation.decorators import (
     support_torch_compile,
 )
 from vllm.config import VllmConfig
-from vllm.distributed import parallel_state
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+    parallel_state,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
@@ -61,11 +67,15 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import (
     ApplyRotaryEmb,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
@@ -304,6 +314,347 @@ Qwen2_5_VLVideoInputs: TypeAlias = (
 # === Vision Encoder === #
 
 
+_VISION_MLP_WEIGHT_ALIGNMENT = 32
+_VISION_MLP_BLOCK_WEIGHT_ALIGNMENT = 128
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _copy_weight_with_padding_(
+    param_data: torch.Tensor,
+    loaded_weight: torch.Tensor,
+) -> None:
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    assert loaded_weight.ndim == param_data.ndim, (
+        f"Cannot load tensor with shape {loaded_weight.shape} into "
+        f"padded parameter with shape {param_data.shape}"
+    )
+    assert all(
+        loaded_dim <= param_dim
+        for loaded_dim, param_dim in zip(loaded_weight.shape, param_data.shape)
+    ), (
+        f"Cannot load tensor with shape {loaded_weight.shape} into "
+        f"smaller parameter with shape {param_data.shape}"
+    )
+
+    param_data.zero_()
+    slices = tuple(slice(0, dim) for dim in loaded_weight.shape)
+    param_data[slices].copy_(loaded_weight)
+
+
+def _use_qwen2_5_vision_mlp_weight_padding(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> bool:
+    if quant_config is None:
+        return False
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None)
+    if not ignored_layers:
+        ignored_layers = getattr(getattr(quant_config, "args", None), "ignore", None)
+    if ignored_layers:
+        gate_up_ignored = should_ignore_layer(
+            f"{prefix}.gate_up_proj",
+            ignore=ignored_layers,
+            fused_mapping={"gate_up_proj": ["gate_proj", "up_proj"]},
+        )
+        down_ignored = should_ignore_layer(
+            f"{prefix}.down_proj",
+            ignore=ignored_layers,
+        )
+        if gate_up_ignored and down_ignored:
+            return False
+
+    quant_method = quant_config.get_name()
+    if quant_method == "online":
+        linear_spec = getattr(getattr(quant_config, "args", None), "linear", None)
+        return (
+            linear_spec is not None
+            and getattr(linear_spec, "weight", None) is not None
+        )
+
+    if quant_method == "fp8":
+        return not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+
+    return False
+
+
+def _qwen2_5_vision_mlp_weight_alignment(
+    quant_config: QuantizationConfig | None,
+) -> int:
+    if quant_config is None:
+        return _VISION_MLP_WEIGHT_ALIGNMENT
+
+    if getattr(quant_config, "weight_block_size", None) is not None:
+        return _VISION_MLP_BLOCK_WEIGHT_ALIGNMENT
+
+    linear_spec = getattr(getattr(quant_config, "args", None), "linear", None)
+    weight_key = getattr(linear_spec, "weight", None)
+    scale = getattr(weight_key, "scale", None)
+    group_shape = getattr(scale, "group_shape", None)
+    if (
+        getattr(group_shape, "row", None) == _VISION_MLP_BLOCK_WEIGHT_ALIGNMENT
+        and getattr(group_shape, "col", None) == _VISION_MLP_BLOCK_WEIGHT_ALIGNMENT
+    ):
+        return _VISION_MLP_BLOCK_WEIGHT_ALIGNMENT
+
+    return _VISION_MLP_WEIGHT_ALIGNMENT
+
+
+class Qwen2_5_VisionMLPMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged gate/up projection with physical padding for FP8-family kernels."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        loaded_input_size: int,
+        loaded_output_sizes: list[int],
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        disable_tp: bool = False,
+    ) -> None:
+        self.loaded_input_size = loaded_input_size
+        self.loaded_output_sizes = loaded_output_sizes
+        super().__init__(
+            input_size=input_size,
+            output_sizes=output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=disable_tp,
+        )
+
+    def _physical_shard_info(self, shard_id: int) -> tuple[int, int]:
+        shard_offset = sum(self.output_sizes[:shard_id])
+        shard_size = self.output_sizes[shard_id]
+        return shard_offset // self.tp_size, shard_size // self.tp_size
+
+    def _loaded_shard_size(self, shard_id: int) -> int:
+        return divide(self.loaded_output_sizes[shard_id], self.tp_size)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+
+        output_dim = getattr(param, "output_dim", None)
+        if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+            if output_dim is None:
+                _copy_weight_with_padding_(param.data, loaded_weight)
+                return
+
+            shard_ids = (
+                list(range(len(self.loaded_output_sizes)))
+                if loaded_shard_id is None
+                else list(loaded_shard_id)
+            )
+            current_offset = 0
+            for shard_id in shard_ids:
+                loaded_shard_size = self.loaded_output_sizes[shard_id]
+                loaded_weight_shard = loaded_weight.narrow(
+                    output_dim, current_offset, loaded_shard_size
+                )
+                self.weight_loader(param, loaded_weight_shard, shard_id)
+                current_offset += loaded_shard_size
+            return
+
+        assert loaded_shard_id < len(self.output_sizes)
+        if output_dim is None:
+            _copy_weight_with_padding_(param.data, loaded_weight)
+            return
+
+        shard_offset, shard_size = self._physical_shard_info(loaded_shard_id)
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        if not is_sharded_weight:
+            loaded_shard_size = self._loaded_shard_size(loaded_shard_id)
+            loaded_weight = loaded_weight.narrow(
+                output_dim,
+                self.tp_rank * loaded_shard_size,
+                loaded_shard_size,
+            )
+
+        _copy_weight_with_padding_(param_data, loaded_weight)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+
+        output_dim = getattr(param, "output_dim", None)
+        if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+            if output_dim is None:
+                _copy_weight_with_padding_(param.data, loaded_weight)
+                return
+
+            shard_ids = (
+                list(range(len(self.loaded_output_sizes)))
+                if loaded_shard_id is None
+                else list(loaded_shard_id)
+            )
+            current_offset = 0
+            for shard_id in shard_ids:
+                loaded_shard_size = self.loaded_output_sizes[shard_id]
+                loaded_weight_shard = loaded_weight.narrow(
+                    output_dim, current_offset, loaded_shard_size
+                )
+                self.weight_loader_v2(param, loaded_weight_shard, shard_id)
+                current_offset += loaded_shard_size
+            return
+
+        assert loaded_shard_id < len(self.output_sizes)
+        if output_dim is None:
+            _copy_weight_with_padding_(param.data, loaded_weight)
+            return
+
+        shard_offset, shard_size = self._physical_shard_info(loaded_shard_id)
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        if not is_sharded_weight:
+            loaded_shard_size = self._loaded_shard_size(loaded_shard_id)
+            loaded_weight = loaded_weight.narrow(
+                output_dim,
+                self.tp_rank * loaded_shard_size,
+                loaded_shard_size,
+            )
+
+        _copy_weight_with_padding_(param_data, loaded_weight)
+
+
+class Qwen2_5_VisionMLPRowParallelLinear(RowParallelLinear):
+    """Row projection that consumes the padded SwiGLU hidden dimension."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        loaded_input_size: int,
+        loaded_output_size: int,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        disable_tp: bool = False,
+    ) -> None:
+        self.loaded_input_size = loaded_input_size
+        self.loaded_output_size = loaded_output_size
+        self.loaded_input_size_per_partition = divide(
+            loaded_input_size,
+            get_tensor_model_parallel_world_size() if not disable_tp else 1,
+        )
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=disable_tp,
+        )
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+        if input_dim is not None and not is_sharded_weight:
+            loaded_weight = loaded_weight.narrow(
+                input_dim,
+                self.tp_rank * self.loaded_input_size_per_partition,
+                self.loaded_input_size_per_partition,
+            )
+
+        _copy_weight_with_padding_(param.data, loaded_weight)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        # The parent v2 loader shards by the padded parameter width.  Vision MLP
+        # checkpoints store the unpadded width, so shard in logical space first.
+        if len(loaded_weight.shape) == 0:
+            assert loaded_weight.numel() == 1
+            loaded_weight = loaded_weight.reshape(1)
+
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is not None:
+            loaded_weight = loaded_weight.narrow(
+                input_dim,
+                self.tp_rank * self.loaded_input_size_per_partition,
+                self.loaded_input_size_per_partition,
+            )
+
+        _copy_weight_with_padding_(param.data, loaded_weight)
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, nn.Parameter | None]:
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_,
+                num_partitions=self.tp_size,
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        if input_parallel.shape[-1] < self.input_size_per_partition:
+            input_parallel = F.pad(
+                input_parallel,
+                (0, self.input_size_per_partition - input_parallel.shape[-1]),
+            )
+
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        if output_parallel.shape[-1] > self.loaded_output_size:
+            output_parallel = output_parallel[
+                ..., : self.loaded_output_size
+            ].contiguous()
+
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        if not self.return_bias:
+            return output
+        if self.skip_bias_add and self.bias is not None:
+            output_bias = self.bias[: self.loaded_output_size]
+        else:
+            output_bias = None
+        return output, output_bias
+
+    def extra_repr(self) -> str:
+        s = f"in_features={self.loaded_input_size_per_partition}"
+        s += f", padded_in_features={self.input_size_per_partition}"
+        s += f", output_features={self.loaded_output_size}"
+        s += f", bias={self.bias is not None}"
+        s += f", tp_size={self.tp_size}"
+        s += f", reduce_results={self.reduce_results}"
+        return s
+
+
 class Qwen2_5_VisionMLP(nn.Module):
     def __init__(
         self,
@@ -316,29 +667,92 @@ class Qwen2_5_VisionMLP(nn.Module):
     ):
         super().__init__()
         use_data_parallel = is_vit_use_data_parallel()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=in_features,
-            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-            disable_tp=use_data_parallel,
-        )
+        self.in_features = in_features
+        self.padded_in_features = in_features
+        self.hidden_features = hidden_features
+        self.padded_hidden_features = hidden_features
 
-        self.down_proj = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-            disable_tp=use_data_parallel,
+        use_weight_padding = _use_qwen2_5_vision_mlp_weight_padding(
+            quant_config, prefix
         )
+        if use_weight_padding:
+            weight_alignment = _qwen2_5_vision_mlp_weight_alignment(quant_config)
+            tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+            hidden_features_per_partition = divide(hidden_features, tp_size)
+            padded_hidden_features_per_partition = _round_up_to_multiple(
+                hidden_features_per_partition,
+                weight_alignment,
+            )
+            self.padded_hidden_features = padded_hidden_features_per_partition * tp_size
+            self.padded_in_features = _round_up_to_multiple(
+                in_features,
+                weight_alignment,
+            )
+
+        if use_weight_padding and (
+            self.padded_in_features != in_features
+            or self.padded_hidden_features != hidden_features
+        ):
+            logger.info_once(
+                "Padding Qwen2.5-VL vision MLP %s from "
+                "in_features=%d, hidden_features=%d to "
+                "in_features=%d, hidden_features=%d for FP8-family GEMM kernels.",
+                prefix,
+                in_features,
+                hidden_features,
+                self.padded_in_features,
+                self.padded_hidden_features,
+            )
+
+        if use_weight_padding:
+            self.gate_up_proj = Qwen2_5_VisionMLPMergedColumnParallelLinear(
+                input_size=self.padded_in_features,
+                output_sizes=[self.padded_hidden_features] * 2,
+                loaded_input_size=in_features,
+                loaded_output_sizes=[hidden_features] * 2,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+                disable_tp=use_data_parallel,
+            )
+            self.down_proj = Qwen2_5_VisionMLPRowParallelLinear(
+                input_size=self.padded_hidden_features,
+                output_size=self.padded_in_features,
+                loaded_input_size=hidden_features,
+                loaded_output_size=in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+                disable_tp=use_data_parallel,
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=in_features,
+                output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+                disable_tp=use_data_parallel,
+            )
+
+            self.down_proj = RowParallelLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+                disable_tp=use_data_parallel,
+            )
         self.act_fn = act_fn
 
     def forward(self, x: torch.Tensor):
+        if x.shape[-1] < self.padded_in_features:
+            x = F.pad(x, (0, self.padded_in_features - x.shape[-1]))
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x_down, _ = self.down_proj(x)
+        if x_down.shape[-1] > self.in_features:
+            x_down = x_down[..., : self.in_features].contiguous()
         return x_down
 
 
